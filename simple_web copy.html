@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>Audio Streaming via WebSocket</title>
+</head>
+
+<body>
+    <h1>Audio Streaming via WebSocket</h1>
+
+    <!-- Start Streaming and Stop Streaming buttons -->
+    <button id="startButton">Start Streaming</button>
+    <button id="stopButton" disabled>Stop Streaming</button>
+    <!-- Add a button to clear the received text -->
+    <button id="clearButton">Clear Text</button>
+
+    <!-- Add an element to display the received text -->
+    <div id="receivedText"></div>
+
+    <script>
+        // Initialize WebSocket connection
+        const socket = new WebSocket('wss://stream.algorit.my.id/ws');
+
+        // Initialize audio context and audio stream
+        const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        let audioStream;
+
+        // Function to start audio streaming
+        const startStreaming = () => {
+            navigator.mediaDevices.getUserMedia({ audio: true })
+                .then(stream => {
+                    audioStream = stream;
+                    const audioSource = audioContext.createMediaStreamSource(stream);
+                    const audioProcessor = audioContext.createScriptProcessor(4096, 1, 1);
+
+                    // Default sample rate (you can change this to the desired value)
+                    const defaultSampleRate = 44100; // 44.1 kHz
+
+                    const audioTrack = stream.getAudioTracks()[0];
+                    const sampleRate = audioTrack ? audioTrack.getSettings().sampleRate || defaultSampleRate : defaultSampleRate;
+
+                    console.log(`Audio sample rate: ${sampleRate} Hz`);
+
+                    audioProcessor.onaudioprocess = (e) => {
+                        const audioData = e.inputBuffer.getChannelData(0);
+                        // Send audio data to WebSocket as binary data
+                        socket.send(audioData.buffer);
+                    };
+
+                    audioSource.connect(audioProcessor);
+                    audioProcessor.connect(audioContext.destination);
+
+                    // Update button states
+                    document.getElementById('startButton').disabled = true;
+                    document.getElementById('stopButton').disabled = false;
+                })
+                .catch(error => {
+                    console.error('Error accessing microphone:', error);
+                });
+        };
+
+        // Function to stop audio streaming and close WebSocket
+        const stopStreaming = () => {
+            if (audioStream) {
+                audioStream.getTracks().forEach(track => track.stop());
+            }
+            audioStream = null;
+            socket.close();
+
+            // Update button states
+            document.getElementById('startButton').disabled = false;
+            document.getElementById('stopButton').disabled = true;
+        };
+
+        // Function to clear the received text
+        const clearReceivedText = () => {
+            const receivedTextElement = document.getElementById('receivedText');
+            receivedTextElement.innerHTML = ''; // Clear the content
+        };
+
+        // Handle WebSocket events
+        socket.addEventListener('open', (event) => {
+            console.log('WebSocket connection opened');
+        });
+
+        socket.addEventListener('message', (event) => {
+            // Display the received text on a new line
+            const receivedTextElement = document.getElementById('receivedText');
+            const newParagraph = document.createElement('p');
+            newParagraph.textContent = event.data;
+            receivedTextElement.appendChild(newParagraph);
+        });
+
+        socket.addEventListener('close', (event) => {
+            console.log('WebSocket connection closed');
+        });
+
+        socket.addEventListener('error', (event) => {
+            console.error('WebSocket error:', event);
+        });
+
+        // Attach click event listeners to buttons
+        document.getElementById('startButton').addEventListener('click', startStreaming);
+        document.getElementById('stopButton').addEventListener('click', stopStreaming);
+        // Attach a click event listener to the clear button
+        document.getElementById('clearButton').addEventListener('click', clearReceivedText);
+
+    </script>
+</body>
+
+</html>

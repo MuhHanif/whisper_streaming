@@ -1,10 +1,20 @@
 #!/usr/bin/env python3
 import sys
 import numpy as np
-import librosa  
+import librosa 
+import io
+import soundfile 
 from functools import lru_cache
 import time
 import argparse
+from faster_whisper import WhisperModel
+
+import asyncio
+from fastapi import FastAPI, WebSocket
+from fastapi.responses import HTMLResponse
+import time
+import threading
+
 
 
 def parse_arguments():
@@ -18,8 +28,6 @@ def parse_arguments():
     parser.add_argument('--lan', '--language', type=str, default='en', help="Language code for transcription, e.g. en,de,cs.")
     parser.add_argument('--task', type=str, default='transcribe', choices=["transcribe","translate"],help="Transcribe or translate.")
     parser.add_argument('--start_at', type=float, default=0.0, help='Start processing audio at this time.')
-    parser.add_argument('--backend', type=str, default="faster-whisper", choices=["faster-whisper", "whisper_timestamped"],help='Load only this backend for Whisper processing.')
-    parser.add_argument('--offline', action="store_true", default=False, help='Offline mode.')
     parser.add_argument('--comp_unaware', action="store_true", default=False, help='Computationally unaware simulation.')
     parser.add_argument('--vad', action="store_true", default=True, help='Use VAD = voice activity detection, with the default parameters.')
     return parser.parse_args()
@@ -57,44 +65,6 @@ class ASRBase:
 
     def use_vad(self):
         raise NotImplemented("must be implemented in the child class")
-
-
-## requires imports:
-#      import whisper
-#      import whisper_timestamped
-
-class WhisperTimestampedASR(ASRBase):
-    """Uses whisper_timestamped library as the backend. Initially, we tested the code on this backend. It worked, but slower than faster-whisper.
-    On the other hand, the installation for GPU could be easier.
-
-    If used, requires imports:
-        import whisper
-        import whisper_timestamped
-    """
-
-    def load_model(self, modelsize=None, cache_dir=None, model_dir=None):
-        if model_dir is not None:
-            print("ignoring model_dir, not implemented",file=sys.stderr)
-        return whisper.load_model(modelsize, download_root=cache_dir)
-
-    def transcribe(self, audio, init_prompt=""):
-        result = whisper_timestamped.transcribe_timestamped(self.model, audio, language=self.original_language, initial_prompt=init_prompt, verbose=None, condition_on_previous_text=True)
-        return result
- 
-    def ts_words(self,r):
-        # return: transcribe result object to [(beg,end,"word1"), ...]
-        o = []
-        for s in r["segments"]:
-            for w in s["words"]:
-                t = (w["start"],w["end"],w["text"])
-                o.append(t)
-        return o
-
-    def segments_end_ts(self, res):
-        return [s["end"] for s in res["segments"]]
-
-    def use_vad(self):
-        raise NotImplemented("Feature use_vad is not implemented for whisper_timestamped backend.")
 
 
 class FasterWhisperASR(ASRBase):
@@ -466,142 +436,157 @@ def create_tokenizer(lan):
     return WtPtok()
 
 
+##### FAST API PART! #####
+
+app = FastAPI()
+# Set up a global variable to keep track of the WebSocket connections
+connected_websockets = set()
+
+# Store the received audio data
+audio_data = bytearray()
+
+#TODO: hard code value for now (properly replace this!)
+size = "base.en"
+language = "en"
+chunk = 1
+SAMPLING_RATE =16000
+
+# load whisper
+whisper_asr = FasterWhisperASR(modelsize=size, lan=language)
+whisper_asr.use_vad()
+
+async def send_transcription(websocket, preprocessor_obj, bytearray_data):
+
+    if bytearray_data:
+        # this is the function that sending the transcription back to websocket
+
+        # convert to numpy and delete it 
+        chunk_audio = np.frombuffer(bytearray_data, dtype=np.int16)
+        # convert it to float32 because insert_audio_chunk need fp32
+        chunk_audio = chunk_audio.astype(np.float32)
+
+        await websocket.send_text("test")
+        preprocessor_obj.insert_audio_chunk(chunk_audio)
+        # try:
+        #     output = preprocessor_obj.process_iter()
+        # except AssertionError:
+        #     print("assertion error",file=sys.stderr)
+        #     pass
+        # else:
+        #     await websocket.send_text(output)
 
 
-## main:
-
-if __name__ == "__main__":
-
-    
-    args = parse_arguments()
-
-    if args.offline and args.comp_unaware:
-        print("No or one option from --offline and --comp_unaware are available, not both. Exiting.",file=sys.stderr)
-        sys.exit(1)
-
-    audio_path = args.audio_path
-
-    SAMPLING_RATE = 16000
-    duration = len(load_audio(audio_path))/SAMPLING_RATE
-    print("Audio duration is: %2.2f seconds" % duration, file=sys.stderr)
-
-    size = args.model
-    language = args.lan
-
-    t = time.time()
-    print(f"Loading Whisper {size} model for {language}...",file=sys.stderr,end=" ",flush=True)
-    #asr = WhisperASR(lan=language, modelsize=size)
-
-    if args.backend == "faster-whisper":
-        from faster_whisper import WhisperModel
-        asr_cls = FasterWhisperASR
-    else:
-        import whisper
-        import whisper_timestamped
-    #    from whisper_timestamped_model import WhisperTimestampedASR
-        asr_cls = WhisperTimestampedASR
-
-    asr = asr_cls(modelsize=size, lan=language, cache_dir=args.model_cache_dir, model_dir=args.model_dir)
-
-    if args.task == "translate":
-        asr.set_translate_task()
-        tgt_language = "en"  # Whisper translates into English
-    else:
-        tgt_language = language  # Whisper transcribes in this language
+# simple demo url
+@app.get("/")
+async def serve_html():
+    # Serve the HTML file
+    with open("simple_web.html", "r") as html_file:
+        content = html_file.read()
+    return HTMLResponse(content)
 
 
-    e = time.time()
-    print(f"done. It took {round(e-t,2)} seconds.",file=sys.stderr)
-
-    if args.vad:
-        print("setting VAD filter",file=sys.stderr)
-        asr.use_vad()
-
-    
-    min_chunk = args.min_chunk_size
-    online = OnlineASRProcessor(asr,create_tokenizer(tgt_language))
-
-
-    # load the audio into the LRU cache before we start the timer
-    a = load_audio_chunk(audio_path,0,1)
-
-    # warm up the ASR, because the very first transcribe takes much more time than the other
-    asr.transcribe(a)
-
-    beg = args.start_at
-    start = time.time()-beg
-
-    def output_transcript(o, now=None):
-        # output format in stdout is like:
-        # 4186.3606 0 1720 Takhle to je
-        # - the first three words are:
-        #    - emission time from beginning of processing, in milliseconds
-        #    - beg and end timestamp of the text segment, as estimated by Whisper model. The timestamps are not accurate, but they're useful anyway
-        # - the next words: segment transcript
-        if now is None:
-            now = time.time()-start
-        if o[0] is not None:
-            print("%1.4f %1.0f %1.0f %s" % (now*1000, o[0]*1000,o[1]*1000,o[2]),file=sys.stderr,flush=True)
-            print("%1.4f %1.0f %1.0f %s" % (now*1000, o[0]*1000,o[1]*1000,o[2]),flush=True)
-        else:
-            print(o,file=sys.stderr,flush=True)
-
-    if args.offline: ## offline mode processing (for testing/debugging)
-        a = load_audio(audio_path)
-        online.insert_audio_chunk(a)
+# Define a function to send "testing" at a 5-second interval to all connected websockets
+async def send_testing(audio_data, websocket, preprocessor_obj):
+    # while True:
+        # for websocket in connected_websockets:
+    if audio_data:
         try:
-            o = online.process_iter()
-        except AssertionError:
-            print("assertion error",file=sys.stderr)
+            # convert audio to numpy so it can be processed by whisper 
+            audio,sample_rate = soundfile.read(io.BytesIO(audio_data), channels=1,samplerate=44100,dtype='float32', format='RAW', subtype='FLOAT', endian='LITTLE')
+            # debug save to wav
+            # soundfile.write("testing.wav", audio, sample_rate, subtype='FLOAT', format='WAV', endian='LITTLE')
+            target_sample_rate =16000
+            resampled_audio = librosa.resample(audio, orig_sr=sample_rate, target_sr=target_sample_rate)
+            # manual_transcribe = whisper_asr.transcribe(resampled_audio)#, initial_prompt=initial_prompt, condition_on_previous_text=True)
+            # manual_transcribe = whisper_asr.ts_words(manual_transcribe)
+            
+            # await websocket.send_text(f"audio sample rate: {sample_rate} ==> transcription: {manual_transcribe}")
+
+            preprocessor_obj.insert_audio_chunk(resampled_audio)
+            o = preprocessor_obj.process_iter()
+            if o[0]:
+                await websocket.send_text(f"audio sample rate: {sample_rate} ==> transcription: {o}")
+
+        except Exception as e:
+            await websocket.send_text(f"error {e}")
+            # Handle exceptions here, e.g., if a WebSocket connection is closed
             pass
-        else:
-            output_transcript(o)
-        now = None
-    elif args.comp_unaware:  # computational unaware mode 
-        end = beg + min_chunk
+            # await asyncio.sleep(0.1)
+    # return initial_prompt
+
+@app.websocket("/ws")
+async def audio_stream(websocket: WebSocket):
+    audio_data = bytearray()
+    await websocket.accept()
+    # init transcription concatenation logic
+    online = OnlineASRProcessor(whisper_asr,create_tokenizer(language))
+    # connected_websockets.add(websocket)
+    # asyncio.create_task(send_testing())
+    beg = 0
+    start = time.time()-beg
+    end = 0
+    min_chunk = 2
+    initial_prompt = ""
+    try:
         while True:
-            a = load_audio_chunk(audio_path,beg,end)
-            online.insert_audio_chunk(a)
-            try:
-                o = online.process_iter()
-            except AssertionError:
-                print("assertion error",file=sys.stderr)
-                pass
-            else:
-                output_transcript(o, now=end)
-
-            print(f"## last processed {end:.2f}s",file=sys.stderr,flush=True)
-
-            beg = end
-            end += min_chunk
-            if end >= duration:
-                break
-        now = duration
-
-    else: # online = simultaneous mode
-        end = 0
-        while True:
+            # retrieve audio stream from websocket
+            data = await websocket.receive_bytes()
+            # stash audio data
+            audio_data.extend(data)
+            # keep stashing the bytes until the chunk time is filled
             now = time.time() - start
             if now < end+min_chunk:
-                time.sleep(min_chunk+end-now)
+                continue
             end = time.time() - start
-            a = load_audio_chunk(audio_path,beg,end)
-            beg = end
-            online.insert_audio_chunk(a)
+            
+            # simulate task
+            np_start = time.time()
+            asyncio.create_task(send_testing(audio_data,websocket, online))
+            audio_data = bytearray()
+            np_stop = time.time()
 
-            try:
-                o = online.process_iter()
-            except AssertionError:
-                print("assertion error",file=sys.stderr)
-                pass
-            else:
-                output_transcript(o)
+
+    except Exception as e:
+        print(e)
+
+@app.websocket("/ws_transcribe")
+async def audio_stream(websocket: WebSocket):
+    # store audio byte stream here
+    audio_data = bytearray()
+
+    # accept websocket connection
+    await websocket.accept(bytearray)
+
+    # init transcription concatenation logic
+    online = OnlineASRProcessor(whisper_model,create_tokenizer(language))
+
+    min_chunk = 5
+    beg = 0
+    start = time.time()-beg
+    end = 0
+
+    try:
+        while True:
+            # retrieve audio stream from websocket
+            data = await websocket.receive_bytes()
+            # stash audio data
+            audio_data.extend(data)
+
+            # keep stashing the bytes until the chunk time is filled
             now = time.time() - start
-            print(f"## last processed {end:.2f} s, now is {now:.2f}, the latency is {now-end:.2f}",file=sys.stderr,flush=True)
+            if now < end+min_chunk:
+                continue
+            end = time.time() - start
+            # send to transcribe process
+            asyncio.create_task(
+                send_transcription(
+                    websocket=websocket, 
+                    preprocessor_obj=online,
+                    bytearray_data=audio_data
+                )
+            )
+            # flush byte array
+            audio_data = bytearray()
+    except Exception as e:
+        print(e)
 
-            if end >= duration:
-                break
-        now = None
-
-    o = online.finish()
-    output_transcript(o, now=now)
